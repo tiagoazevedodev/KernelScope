@@ -41,28 +41,31 @@ func NewMonitor(config *cli.Config) *Monitor {
 // StartMonitoring begins monitoring the specified process
 func (m *Monitor) StartMonitoring(process *executor.Process) *Stats {
 	fmt.Printf("Starting to monitor process PID: %d\n", process.Pid)
-	
+
 	// Set process resource limits
 	err := m.ResourceMgr.SetProcessLimits(process.Pid)
 	if err != nil {
 		fmt.Printf("Warning: Failed to set resource limits: %v\n", err)
 	}
-	
+
 	// Initialize stats
 	m.Stats.StartTime = time.Now()
 	m.Stats.LoopCount = 0
 	m.Stats.SuccessCount = 0
 	m.Stats.CpuTimeUsed = 0
 	m.Stats.MaxMemoryKB = 0
-	
+
 	// Start monitoring goroutine
 	go m.monitorProcess(process)
-	
+
 	// Start timeout goroutine
 	if m.Config.Timeout > 0 {
+		fmt.Printf("Starting timeout timer: %d seconds\n", m.Config.Timeout)
 		go m.enforceTimeout(process)
+	} else {
+		fmt.Println("No timeout set")
 	}
-	
+
 	return m.Stats
 }
 
@@ -70,42 +73,49 @@ func (m *Monitor) StartMonitoring(process *executor.Process) *Stats {
 func (m *Monitor) monitorProcess(process *executor.Process) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	
+
+	limitExceeded := false
+
 	for {
 		select {
 		case <-ticker.C:
 			// Get current resource usage
 			cpuTime, memoryKB, err := m.ResourceMgr.GetResourceUsage(process.Pid)
 			if err != nil {
-				// Process may have terminated
+				fmt.Printf("Error getting resource usage: %v\n", err)
+				// Process may have terminated, but keep monitoring until stopMonitoring signal
 				continue
 			}
-			
+
 			// Update stats
 			m.Stats.CpuTimeUsed = cpuTime
 			if memoryKB > m.Stats.MaxMemoryKB {
 				m.Stats.MaxMemoryKB = memoryKB
 			}
-			
+
 			// Check memory limit
-			if m.Config.MemoryLimit > 0 && memoryKB > uint64(m.Config.MemoryLimit) {
+			if !limitExceeded && m.Config.MemoryLimit > 0 && memoryKB > uint64(m.Config.MemoryLimit) {
 				fmt.Printf("Memory limit exceeded: %d KB > %d KB\n", memoryKB, m.Config.MemoryLimit)
 				m.Stats.TermReason = "Memory limit exceeded"
-				m.terminateProcess(process)
-				return
+				limitExceeded = true
+
+				// Terminate process but keep monitoring
+				m.terminateProcessKeepMonitoring(process)
 			}
-			
+
 			// Check CPU quota
-			if m.ResourceMgr.IsCpuQuotaExceeded(cpuTime) {
+			if !limitExceeded && m.ResourceMgr.IsCpuQuotaExceeded(cpuTime) {
 				fmt.Printf("CPU quota exceeded: %.2f seconds\n", cpuTime)
 				m.Stats.TermReason = "CPU quota exceeded"
-				m.terminateProcess(process)
-				return
+				limitExceeded = true
+
+				// Terminate process but keep monitoring
+				m.terminateProcessKeepMonitoring(process)
 			}
-			
+
 			// Output current stats
 			fmt.Printf("PID: %d | CPU: %.2fs | Memory: %d KB\n", process.Pid, cpuTime, memoryKB)
-			
+
 		case <-m.stopMonitoring:
 			fmt.Println("Stopping monitoring")
 			return
@@ -115,33 +125,68 @@ func (m *Monitor) monitorProcess(process *executor.Process) {
 
 // enforceTimeout enforces the process timeout
 func (m *Monitor) enforceTimeout(process *executor.Process) {
+	timer := time.NewTimer(time.Duration(m.Config.Timeout) * time.Second)
+	defer timer.Stop()
+
 	select {
-	case <-time.After(time.Duration(m.Config.Timeout) * time.Second):
+	case <-timer.C:
 		fmt.Printf("Process timeout after %d seconds\n", m.Config.Timeout)
 		m.Stats.TermReason = "Timeout"
+		// Use terminateProcess to ensure the process is killed
 		m.terminateProcess(process)
 	case <-m.stopMonitoring:
+		fmt.Println("Timeout canceled - monitoring stopped")
 		return
 	}
 }
 
 // terminateProcess terminates the specified process
 func (m *Monitor) terminateProcess(process *executor.Process) {
+	fmt.Printf("Terminating process PID: %d\n", process.Pid)
 	executor := executor.NewExecutor(m.Config)
 	err := executor.KillProcess(process)
 	if err != nil {
 		fmt.Printf("Error killing process: %v\n", err)
+	} else {
+		fmt.Printf("Process PID: %d terminated successfully\n", process.Pid)
 	}
-	
-	m.stopMonitoring <- true
+
+	// Send signal to stop monitoring
+	select {
+	case m.stopMonitoring <- true:
+		fmt.Println("Sent stop monitoring signal")
+	default:
+		fmt.Println("Stop monitoring channel is full or closed")
+	}
+}
+
+// terminateProcessKeepMonitoring terminates the process but keeps monitoring
+func (m *Monitor) terminateProcessKeepMonitoring(process *executor.Process) {
+	fmt.Printf("Terminating process PID: %d (but keeping monitoring)\n", process.Pid)
+	executor := executor.NewExecutor(m.Config)
+	err := executor.KillProcess(process)
+	if err != nil {
+		fmt.Printf("Error killing process: %v\n", err)
+	} else {
+		fmt.Printf("Process PID: %d terminated successfully\n", process.Pid)
+	}
 }
 
 // WaitForCompletion waits for the process to complete and returns the exit code
 func (m *Monitor) WaitForCompletion() *Stats {
-	// Wait for the process to complete
-	// This would be implemented in a real system to wait for the process
-	// to finish or be terminated
-	
+	fmt.Println("Waiting for process completion...")
+
+	// Give a little time for the monitoring goroutines to update stats
+	time.Sleep(500 * time.Millisecond)
+
+	// Send signal to stop monitoring if not already stopped
+	select {
+	case m.stopMonitoring <- true:
+		fmt.Println("Sent stop monitoring signal")
+	default:
+		fmt.Println("Stop monitoring channel is full or closed")
+	}
+
 	m.Stats.EndTime = time.Now()
 	return m.Stats
 }
@@ -152,4 +197,4 @@ func (m *Monitor) RecordLoopIteration(success bool) {
 	if success {
 		m.Stats.SuccessCount++
 	}
-} 
+}

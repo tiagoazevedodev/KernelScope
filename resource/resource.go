@@ -5,7 +5,6 @@ import (
 	"kernelscope/cli"
 	"kernelscope/utils"
 	"runtime"
-	"golang.org/x/sys/unix"
 )
 
 // ResourceManager handles resource limitations
@@ -28,35 +27,17 @@ func (rm *ResourceManager) SetProcessLimits(pid int) error {
 		return nil
 	}
 
-	// Set CPU time limit
-	if rm.Config.CpuLimit > 0 {
-		// Set soft and hard limits for CPU time (in seconds)
-		cpuLimit := unix.Rlimit{
-			Cur: uint64(rm.Config.CpuLimit),
-			Max: uint64(rm.Config.CpuLimit),
-		}
-		
-		err := unix.Prlimit(pid, unix.RLIMIT_CPU, &cpuLimit, nil)
-		if err != nil {
-			return fmt.Errorf("failed to set CPU limits: %v", err)
-		}
-	}
+	// Log what would be set
+	fmt.Printf("Would set CPU limit to %d seconds for PID %d\n", rm.Config.CpuLimit, pid)
+	fmt.Printf("Would set memory limit to %d KB for PID %d\n", rm.Config.MemoryLimit, pid)
 
-	// Set memory limit
-	if rm.Config.MemoryLimit > 0 {
-		// Convert KB to bytes for the memory limit
-		memBytes := uint64(rm.Config.MemoryLimit * 1024)
-		
-		memLimit := unix.Rlimit{
-			Cur: memBytes,
-			Max: memBytes,
-		}
-		
-		err := unix.Prlimit(pid, unix.RLIMIT_AS, &memLimit, nil)
-		if err != nil {
-			return fmt.Errorf("failed to set memory limits: %v", err)
-		}
-	}
+	// Note: In WSL, we can't directly set resource limits via syscall
+	// Instead we'll rely on monitoring and killing processes that exceed limits
+
+	// For production systems, you would use the prlimit command or cgroups
+	// Example (not used here):
+	// cmd := exec.Command("prlimit", "--pid", fmt.Sprintf("%d", pid), "--cpu="+fmt.Sprintf("%d", rm.Config.CpuLimit))
+	// return cmd.Run()
 
 	return nil
 }
@@ -78,16 +59,16 @@ func (rm *ResourceManager) GetResourceUsage(pid int) (float64, uint64, error) {
 	if runtime.GOOS != "linux" {
 		return 0.0, 0, nil
 	}
-	
+
 	// Get stats for the main process
 	stats, err := utils.ReadProcStats(pid)
 	if err != nil {
 		return 0.0, 0, err
 	}
-	
+
 	totalCpuTime := stats.CpuTime
 	totalMemoryKB := stats.MemoryKB
-	
+
 	// Get all child processes
 	childPids, err := utils.GetAllChildProcesses(pid)
 	if err == nil && len(childPids) > 0 {
@@ -100,6 +81,6 @@ func (rm *ResourceManager) GetResourceUsage(pid int) (float64, uint64, error) {
 			}
 		}
 	}
-	
+
 	return totalCpuTime, totalMemoryKB, nil
-} 
+}

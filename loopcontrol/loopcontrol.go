@@ -11,77 +11,106 @@ import (
 
 // LoopController manages the main execution loop
 type LoopController struct {
-	Config     *cli.Config
-	Executor   *executor.Executor
-	Monitor    *monitor.Monitor
+	Config      *cli.Config
+	Executor    *executor.Executor
+	Monitor     *monitor.Monitor
 	UsedCpuTime float64
-	Stats      *monitor.Stats
+	Stats       *monitor.Stats
 }
 
-// NewLoopController creates a new loop controller
 func NewLoopController(config *cli.Config, exec *executor.Executor, mon *monitor.Monitor) *LoopController {
 	return &LoopController{
-		Config:     config,
-		Executor:   exec,
-		Monitor:    mon,
+		Config:      config,
+		Executor:    exec,
+		Monitor:     mon,
 		UsedCpuTime: 0,
-		Stats:      &monitor.Stats{},
+		Stats:       &monitor.Stats{},
 	}
 }
 
 // StartLoop starts the main execution loop
 func (lc *LoopController) StartLoop() {
-	fmt.Println("Starting main execution loop...")
-	
+	fmt.Println("Starting process execution and monitoring...")
+
 	// Initialize stats
 	lc.Stats.StartTime = time.Now()
-	lc.Stats.LoopCount = 0
+	lc.Stats.LoopCount = 1
 	lc.Stats.SuccessCount = 0
-	
-	// Define loop condition based on mode
-	for lc.shouldContinue() {
-		// Report progress
-		reporter.ReportProgress(lc.Stats)
-		
-		// Start a new process
-		process, err := lc.Executor.StartProcess()
-		if err != nil {
-			fmt.Printf("Failed to start process: %v\n", err)
-			lc.Stats.TermReason = "Process start failure"
-			break
-		}
-		
-		// Start monitoring the new process
-		lc.Monitor.StartMonitoring(process)
 
-		// Wait for process to complete
-		result := lc.Monitor.WaitForCompletion()
-		
-		// Update CPU time used
-		lc.UsedCpuTime += result.CpuTimeUsed
-		
-		// Update overall stats
-		lc.updateStats(result)
-		
-		// Record loop iteration
-		success := result.ExitCode == 0 && result.TermReason == ""
-		lc.Monitor.RecordLoopIteration(success)
-		
-		// If we're in prepaid mode, only deduct CPU time if process was successful
-		if lc.Config.PrePaidMode && success {
-			lc.UsedCpuTime += result.CpuTimeUsed
-		} else if !lc.Config.PrePaidMode {
-			// In postpaid mode, always count CPU time
-			lc.UsedCpuTime += result.CpuTimeUsed
-		}
-		
-		// Small delay between iterations
-		time.Sleep(100 * time.Millisecond)
+	// Start process once
+	process, err := lc.Executor.StartProcess()
+	if err != nil {
+		fmt.Printf("Failed to start process: %v\n", err)
+		lc.Stats.TermReason = "Process start failure"
+
+		// Generate report even if process failed to start
+		lc.Stats.EndTime = time.Now()
+		reporter.GenerateReport(lc.Stats, lc.Stats)
+		return
 	}
-	
+
+	// Start monitoring the process
+	lc.Monitor.StartMonitoring(process)
+
+	// Use a separate goroutine to properly wait for the process
+	waitDone := make(chan int)
+	go func() {
+		exitCode, err := lc.Executor.WaitForProcess(process)
+		if err != nil {
+			fmt.Printf("Error waiting for process: %v\n", err)
+		}
+		waitDone <- exitCode
+	}()
+
+	// Wait for process to complete or reach resource limits
+	processRunning := true
+	for processRunning && lc.shouldContinue() {
+		// Report progress
+		reporter.ReportProgress(lc.Monitor.Stats)
+
+		// Check if process has completed via the wait channel
+		select {
+		case exitCode := <-waitDone:
+			lc.Stats.ExitCode = exitCode
+			processRunning = false
+			fmt.Printf("Process exited with code: %d\n", exitCode)
+		case <-time.After(500 * time.Millisecond):
+			// Continue monitoring
+		}
+	}
+
+	// If we broke out of the loop due to resource limits but process is still running
+	if processRunning {
+		fmt.Println("Resource limits reached, terminating process...")
+		lc.Executor.KillProcess(process)
+
+		// Wait for the process to be fully terminated
+		select {
+		case exitCode := <-waitDone:
+			lc.Stats.ExitCode = exitCode
+		case <-time.After(2 * time.Second):
+			fmt.Println("Warning: Process did not terminate gracefully")
+		}
+	}
+
+	// Wait for final process stats
+	result := lc.Monitor.WaitForCompletion()
+
+	// Update CPU time used
+	lc.UsedCpuTime = result.CpuTimeUsed
+
+	// Update overall stats
+	lc.updateStats(result)
+
+	// Record success
+	success := lc.Stats.ExitCode == 0 && lc.Stats.TermReason == ""
+	if success {
+		lc.Stats.SuccessCount = 1
+	}
+
 	lc.Stats.EndTime = time.Now()
 	lc.Stats.CpuTimeUsed = lc.UsedCpuTime
-	
+
 	// Generate final report
 	reporter.GenerateReport(lc.Stats, lc.Stats)
 }
@@ -103,14 +132,14 @@ func (lc *LoopController) updateStats(result *monitor.Stats) {
 	if result.MaxMemoryKB > lc.Stats.MaxMemoryKB {
 		lc.Stats.MaxMemoryKB = result.MaxMemoryKB
 	}
-	
+
 	// Update termination reason if set
 	if result.TermReason != "" {
 		lc.Stats.TermReason = result.TermReason
 	}
-	
+
 	// Update exit code if non-zero
 	if result.ExitCode != 0 {
 		lc.Stats.ExitCode = result.ExitCode
 	}
-} 
+}
